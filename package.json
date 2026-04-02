@@ -1,0 +1,11 @@
+{
+  "name": "flowcash-bot",
+  "version": "1.0.0",
+  "main": "bot-server.js",
+  "scripts": { "start": "node bot-server.js" },
+  "dependencies": {
+    "express": "^4.18.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.0.0"
+  }
+}
