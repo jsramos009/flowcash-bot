@@ -1,7 +1,9 @@
 /**
- * WhatsApp Bot — FlowCash Edition (FINAL)
- * Tabela principal: transactions
- * Colunas: id, workspace_id, type, description, category, value, date, source, obs, bank_account_id
+ * WhatsApp Bot — FlowCash Edition (FINAL v2)
+ * 
+ * Novidade: busca contas bancárias dinamicamente do Supabase
+ * antes de classificar, para o Claude saber quais contas existem
+ * e vincular corretamente o bank_account_id.
  *
  * npm install express axios dotenv
  * node bot-server.js
@@ -18,81 +20,121 @@ const C = {
   EVO_KEY:       process.env.EVOLUTION_API_KEY,
   EVO_INSTANCE:  process.env.EVOLUTION_INSTANCE,
   CLAUDE_KEY:    process.env.CLAUDE_API_KEY,
-  SUPABASE_URL:  process.env.SUPABASE_URL,         // https://XXXX.supabase.co
-  SUPABASE_KEY:  process.env.SUPABASE_SERVICE_KEY, // service_role key
-  WORKSPACE_ID:  process.env.WORKSPACE_ID,         // seu workspace_id (uuid)
-  CREATED_BY:    process.env.USER_ID,              // seu user id (uuid)
+  SUPABASE_URL:  process.env.SUPABASE_URL,
+  SUPABASE_KEY:  process.env.SUPABASE_SERVICE_KEY,
+  WORKSPACE_ID:  process.env.WORKSPACE_ID,
+  CREATED_BY:    process.env.USER_ID,
   ALLOWED:       process.env.ALLOWED_NUMBERS?.split(",") || [],
   PORT:          process.env.PORT || 3000,
 };
 
-// ─── IDs DAS CONTAS BANCÁRIAS (bank_accounts) ─────────────────────────────────
-// Copie os UUIDs reais de: Supabase → bank_accounts
-// Ex: SELECT id, name FROM bank_accounts WHERE workspace_id = 'seu-workspace';
-const BANK_ACCOUNTS = {
-  pix:     process.env.BANK_ID_PIX,      // uuid da conta Pix
-  cartao:  process.env.BANK_ID_CARTAO,   // uuid da conta Cartão
-  dinheiro:process.env.BANK_ID_DINHEIRO, // uuid da conta Dinheiro
-};
+// ─── BUSCAR CONTAS BANCÁRIAS DO SUPABASE ─────────────────────────────────────
+// Chamado uma vez por mensagem — retorna as contas cadastradas no workspace
+async function buscarContas() {
+  try {
+    const res = await axios.get(
+      `${C.SUPABASE_URL}/rest/v1/bank_accounts?workspace_id=eq.${C.WORKSPACE_ID}&select=id,bank_name,bank_code`,
+      {
+        headers: {
+          apikey: C.SUPABASE_KEY,
+          Authorization: `Bearer ${C.SUPABASE_KEY}`,
+        },
+      }
+    );
+    return res.data || [];
+  } catch (err) {
+    console.error("Erro ao buscar contas:", err.message);
+    return [];
+  }
+}
 
-// ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `Você é o assistente financeiro do FlowCash.
+// ─── MONTAR SYSTEM PROMPT DINÂMICO ────────────────────────────────────────────
+// Injeta as contas reais do usuário no prompt para o Claude poder vincular
+function montarPrompt(contas) {
+  const listaContas = contas.length > 0
+    ? contas.map(c => `  - "${c.bank_name}" → id: "${c.id}"`).join("\n")
+    : "  - Nenhuma conta cadastrada";
+
+  return `Você é o assistente financeiro do FlowCash.
 Analise mensagens, fotos, prints e PDFs do WhatsApp e extraia os dados financeiros.
+
+CONTAS BANCÁRIAS CADASTRADAS NO SISTEMA:
+${listaContas}
 
 TIPOS de transação:
 - "entrada" → receita, venda, recebimento, pagamento recebido
 - "despesa" → gasto, pagamento feito, custo, saída
 
-MÉTODO DE PAGAMENTO (campo category):
-- "Pix" → pix, transferência, ted, doc, pixzinho
-- "Cartão" → cartão, crédito, débito, maquininha, card
-- "Dinheiro" → dinheiro, espécie, cash, nota, cédula
+MÉTODO DE PAGAMENTO (campo category) — valores exatos:
+- "Pix" → pix, transferência, ted, doc
+- "Cartão" → cartão, crédito, débito, maquininha
+- "Dinheiro" → dinheiro, espécie, cash, nota
 - null → quando não mencionado
 
-SOURCE (de onde vem o lançamento):
-- "Caixa do Dia" → transação do dia, caixa diário, entrada/saída rápida
-- "Balanço" → venda formal, despesa registrada, nota fiscal
-- "Boleto" → boleto, financiamento, parcela → use tabela boletos separada
-- "Custos Fixos" → aluguel, mensalidade, recorrente → use tabela budget_items
-- "Custos Variáveis" → matéria-prima, insumo, variável → use tabela budget_items
+CONTA BANCÁRIA (bank_account_id):
+- Identifique qual banco foi mencionado na mensagem
+- Cruze com a lista de contas cadastradas acima
+- Se o banco for mencionado e existir na lista, use o id correspondente
+- Se não for mencionado ou não existir, use null
+
+SOURCE — de onde vem o lançamento:
+- "Caixa do Dia" → transação rápida do dia, entrada ou saída de caixa
+- "Balanço" → venda formal, despesa com nota, registro contábil
+- "Boleto" → boleto, financiamento, parcela → tabela: boletos
+- "Custos Fixos" → aluguel, mensalidade, recorrente → tabela: budget_items
+- "Custos Variáveis" → matéria-prima, insumo, material → tabela: budget_items
 
 Responda SOMENTE em JSON válido, sem markdown, sem texto extra.
 
+Para transações normais (Caixa do Dia ou Balanço):
 {
-  "tabela": "transactions|boletos|budget_items",
+  "tabela": "transactions",
   "confianca": 0.95,
-  "resumo": "Descrição curta do registro",
+  "resumo": "descrição curta",
   "dados": {
     "type": "entrada|despesa",
     "description": "descrição do lançamento",
     "category": "Pix|Cartão|Dinheiro|null",
-    "value": 150.00,
+    "value": 500.00,
     "date": "2026-04-01",
-    "source": "Caixa do Dia|Balanço|Boleto|Custos Fixos|Custos Variáveis",
-    "obs": "observação opcional"
+    "source": "Caixa do Dia|Balanço",
+    "obs": "observação opcional",
+    "bank_account_id": "uuid-da-conta-ou-null"
   }
 }
 
-Para boletos, use este formato em dados:
+Para boletos:
 {
-  "descricao": "nome do boleto",
-  "valor_total": 1000.00,
-  "num_parcelas": 10,
-  "data_vencimento": "2026-05-10",
-  "obs": ""
+  "tabela": "boletos",
+  "confianca": 0.95,
+  "resumo": "descrição curta",
+  "dados": {
+    "descricao": "nome do boleto",
+    "valor_total": 1000.00,
+    "num_parcelas": 10,
+    "data_vencimento": "2026-05-10",
+    "bank_account_id": "uuid-da-conta-ou-null",
+    "obs": ""
+  }
 }
 
-Para budget_items (custos fixos/variáveis), use:
+Para custos fixos ou variáveis:
 {
-  "name": "nome do custo",
-  "amount": 500.00,
-  "category": "categoria",
-  "type": "fixed|variable",
-  "description": "descrição"
+  "tabela": "budget_items",
+  "confianca": 0.95,
+  "resumo": "descrição curta",
+  "dados": {
+    "name": "nome do custo",
+    "amount": 500.00,
+    "category": "categoria livre",
+    "type": "fixed|variable",
+    "description": "descrição"
+  }
 }`;
+}
 
 // ─── CLASSIFICAR COM CLAUDE ───────────────────────────────────────────────────
-async function classificar(texto, base64 = null, mimeType = null) {
+async function classificar(texto, contas, base64 = null, mimeType = null) {
   const content = [];
 
   if (base64 && mimeType) {
@@ -115,7 +157,7 @@ async function classificar(texto, base64 = null, mimeType = null) {
     {
       model: "claude-sonnet-4-20250514",
       max_tokens: 1000,
-      system: SYSTEM_PROMPT,
+      system: montarPrompt(contas),
       messages: [{ role: "user", content }],
     },
     {
@@ -132,13 +174,12 @@ async function classificar(texto, base64 = null, mimeType = null) {
 }
 
 // ─── SALVAR NO SUPABASE ───────────────────────────────────────────────────────
-async function salvar(classificacao, textoOriginal, mediaUrl = null) {
+async function salvar(classificacao, textoOriginal) {
   const { tabela, dados } = classificacao;
 
   let payload;
 
   if (tabela === "transactions") {
-    // Mapeia exatamente para as colunas reais da tabela transactions
     payload = {
       workspace_id:    C.WORKSPACE_ID,
       created_by:      C.CREATED_BY,
@@ -149,47 +190,48 @@ async function salvar(classificacao, textoOriginal, mediaUrl = null) {
       date:            dados.date || new Date().toISOString().split("T")[0],
       source:          dados.source || "Caixa do Dia",
       obs:             dados.obs
-        ? `${dados.obs} | via WhatsApp Bot`
-        : "via WhatsApp Bot",
-      bank_account_id: dados.category ? BANK_ACCOUNTS[dados.category.toLowerCase().replace("ã", "a")] : null,
+                         ? `${dados.obs} | via WhatsApp Bot`
+                         : "via WhatsApp Bot",
+      bank_account_id: dados.bank_account_id || null,
     };
 
   } else if (tabela === "boletos") {
     payload = {
       workspace_id:    C.WORKSPACE_ID,
       created_by:      C.CREATED_BY,
-      descricao:       dados.descricao || dados.description || textoOriginal,
+      descricao:       dados.descricao || textoOriginal,
       valor_total:     Number(dados.valor_total) || 0,
       num_parcelas:    Number(dados.num_parcelas) || 1,
       data_vencimento: dados.data_vencimento || null,
       parcelas_pagas:  0,
       status:          "pendente",
+      bank_account_id: dados.bank_account_id || null,
       obs:             "via WhatsApp Bot",
     };
 
   } else if (tabela === "budget_items") {
     payload = {
-      workspace_id:    C.WORKSPACE_ID,
-      created_by:      C.CREATED_BY,
-      name:            dados.name || dados.description || textoOriginal,
-      amount:          Number(dados.amount) || 0,
-      category:        dados.category || null,
-      type:            dados.type || "variable",
-      description:     `${dados.description || ""} | via WhatsApp Bot`,
+      workspace_id: C.WORKSPACE_ID,
+      created_by:   C.CREATED_BY,
+      name:         dados.name || textoOriginal,
+      amount:       Number(dados.amount) || 0,
+      category:     dados.category || null,
+      type:         dados.type || "variable",
+      description:  `${dados.description || ""} | via WhatsApp Bot`.trim(),
     };
 
   } else {
-    // Fallback: salva em transactions como despesa genérica
+    // Fallback seguro
     payload = {
-      workspace_id:    C.WORKSPACE_ID,
-      created_by:      C.CREATED_BY,
-      type:            "despesa",
-      description:     textoOriginal,
-      category:        null,
-      value:           0,
-      date:            new Date().toISOString().split("T")[0],
-      source:          "Caixa do Dia",
-      obs:             "⚠️ Não classificado automaticamente — revisar | via WhatsApp Bot",
+      workspace_id: C.WORKSPACE_ID,
+      created_by:   C.CREATED_BY,
+      type:         "despesa",
+      description:  textoOriginal,
+      category:     null,
+      value:        0,
+      date:         new Date().toISOString().split("T")[0],
+      source:       "Caixa do Dia",
+      obs:          "⚠️ Não classificado — revisar | via WhatsApp Bot",
     };
   }
 
@@ -198,10 +240,10 @@ async function salvar(classificacao, textoOriginal, mediaUrl = null) {
     payload,
     {
       headers: {
-        apikey:          C.SUPABASE_KEY,
-        Authorization:   `Bearer ${C.SUPABASE_KEY}`,
-        "Content-Type":  "application/json",
-        Prefer:          "return=representation",
+        apikey:         C.SUPABASE_KEY,
+        Authorization:  `Bearer ${C.SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer:         "return=representation",
       },
     }
   );
@@ -209,7 +251,7 @@ async function salvar(classificacao, textoOriginal, mediaUrl = null) {
   return { tabela, id: res.data?.[0]?.id };
 }
 
-// ─── BAIXAR MÍDIA DA EVOLUTION ────────────────────────────────────────────────
+// ─── EVOLUTION: BAIXAR MÍDIA ──────────────────────────────────────────────────
 async function baixarMidia(msgId) {
   try {
     const res = await axios.get(
@@ -220,7 +262,7 @@ async function baixarMidia(msgId) {
   } catch { return null; }
 }
 
-// ─── ENVIAR RESPOSTA WHATSAPP ─────────────────────────────────────────────────
+// ─── EVOLUTION: RESPONDER ─────────────────────────────────────────────────────
 async function responder(numero, texto) {
   await axios.post(
     `${C.EVO_URL}/message/sendText/${C.EVO_INSTANCE}`,
@@ -230,38 +272,43 @@ async function responder(numero, texto) {
 }
 
 // ─── FORMATAR RESPOSTA ────────────────────────────────────────────────────────
-function formatarResposta(cl, tabela, id) {
+function formatarResposta(cl, contas) {
   const d = cl.dados;
   const isEntrada = d?.type === "entrada";
+  const emoji = isEntrada ? "💚" : "🔴";
+  const titulo = isEntrada ? "Entrada registrada!" : "Despesa registrada!";
+
+  // Descobre o nome do banco pelo id
+  const conta = contas.find(c => c.id === d?.bank_account_id);
+  const nomeConta = conta?.bank_name || null;
 
   const linhas = [
-    isEntrada ? "💚 *Entrada registrada!*" : "🔴 *Despesa registrada!*",
+    `${emoji} *${titulo}*`,
     "",
-    `📂 *Módulo:* ${d?.source || tabela}`,
+    `📂 *Módulo:* ${d?.source || cl.tabela}`,
     `📝 *Descrição:* ${d?.description || d?.descricao || d?.name || "—"}`,
   ];
 
   const valor = d?.value || d?.valor_total || d?.amount;
   if (valor) linhas.push(`💵 *Valor:* R$ ${Number(valor).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}`);
-
   if (d?.category) linhas.push(`💳 *Pagamento:* ${d.category}`);
+  if (nomeConta) linhas.push(`🏦 *Conta:* ${nomeConta}`);
   if (d?.date) linhas.push(`📅 *Data:* ${d.date}`);
   if (d?.num_parcelas) linhas.push(`🔢 *Parcelas:* ${d.num_parcelas}x`);
   if (d?.data_vencimento) linhas.push(`⏰ *Vencimento:* ${d.data_vencimento}`);
 
-  const confianca = Math.round(cl.confianca * 100);
-  linhas.push("", `🎯 *Confiança:* ${confianca}%`);
+  const pct = Math.round(cl.confianca * 100);
+  linhas.push("", `🎯 *Confiança:* ${pct}%`);
 
-  if (confianca < 80) {
-    linhas.push("", "⚠️ Confiança baixa — confirme em fl-cash.lovable.app");
-  }
+  if (pct < 80) linhas.push("\n⚠️ Confiança baixa — confirme em fl-cash.lovable.app");
+  if (!nomeConta && !d?.bank_account_id) linhas.push("\n📌 Conta não identificada — vincule manualmente no sistema");
 
   return linhas.join("\n");
 }
 
 // ─── WEBHOOK ──────────────────────────────────────────────────────────────────
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // Responde imediatamente para a Evolution não reenviar
 
   try {
     const body = req.body;
@@ -277,7 +324,7 @@ app.post("/webhook", async (req, res) => {
 
     const tipo = body.data?.messageType;
     const msg  = body.data?.message;
-    let texto = "", base64 = null, mimeType = null, mediaUrl = null;
+    let texto = "", base64 = null, mimeType = null;
 
     if (tipo === "conversation" || tipo === "extendedTextMessage") {
       texto = msg?.conversation || msg?.extendedTextMessage?.text || "";
@@ -285,15 +332,16 @@ app.post("/webhook", async (req, res) => {
     } else if (tipo === "imageMessage") {
       texto = msg?.imageMessage?.caption || "";
       const m = await baixarMidia(body.data?.key?.id);
-      if (m?.base64) { base64 = m.base64; mimeType = "image/jpeg"; mediaUrl = m.mediaUrl; }
+      if (m?.base64) { base64 = m.base64; mimeType = "image/jpeg"; }
 
     } else if (tipo === "documentMessage") {
       texto = msg?.documentMessage?.caption || msg?.documentMessage?.fileName || "";
       const m = await baixarMidia(body.data?.key?.id);
-      if (m?.base64) { base64 = m.base64; mimeType = msg?.documentMessage?.mimetype || "application/pdf"; mediaUrl = m.mediaUrl; }
+      if (m?.base64) { base64 = m.base64; mimeType = msg?.documentMessage?.mimetype || "application/pdf"; }
 
     } else if (tipo === "videoMessage") {
       texto = msg?.videoMessage?.caption || "";
+
     } else {
       return;
     }
@@ -302,15 +350,22 @@ app.post("/webhook", async (req, res) => {
 
     await responder(numero, "⏳ Registrando no FlowCash...");
 
-    const classificacao = await classificar(texto, base64, mimeType);
-    const resultado = await salvar(classificacao, texto, mediaUrl);
+    // Busca contas em tempo real antes de classificar
+    const contas = await buscarContas();
 
-    await responder(numero, formatarResposta(classificacao, resultado.tabela, resultado.id));
+    const classificacao = await classificar(texto, contas, base64, mimeType);
+    const resultado = await salvar(classificacao, texto);
+
+    await responder(numero, formatarResposta(classificacao, contas));
 
   } catch (err) {
     console.error("❌ Erro:", err.response?.data || err.message);
   }
 });
 
-app.get("/health", (_, res) => res.json({ ok: true }));
-app.listen(C.PORT, () => console.log(`🤖 FlowCash Bot :${C.PORT}`));
+app.get("/health", (_, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+
+app.listen(C.PORT, () => {
+  console.log(`🤖 FlowCash Bot rodando na porta ${C.PORT}`);
+  console.log(`📡 Webhook → POST http://localhost:${C.PORT}/webhook`);
+});
